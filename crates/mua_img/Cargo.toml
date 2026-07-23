@@ -1,0 +1,29 @@
+[package]
+name = "mua_img"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+dds = "0.2"
+mua_assets = { path = "../mua_assets" }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "pnm",
+    "webp",
+] }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+mua_assets = { path = "../mua_assets" }
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
