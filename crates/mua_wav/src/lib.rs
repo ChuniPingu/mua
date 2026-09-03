@@ -102,7 +102,7 @@ impl Default for NormalizeOptions {
             offset_seconds: 0.0,
             sample_format: SampleFormat::S16,
             sample_rate: 48_000,
-            loudness_lufs: -8.25,
+            loudness_lufs: -8.5,
             loudness_range_lu: 11.0,
             true_peak_dbtp: 0.0,
             true_peak_tolerance_db: 0.5,
@@ -171,9 +171,7 @@ pub struct LoudnessStats {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LinearTargets {
     loudness_lufs: f64,
-    loudness_range_lu: f64,
     relaxed_loudness: bool,
-    relaxed_range: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,33 +360,17 @@ fn apply_offset(
 fn linear_targets(stats: LoudnessStats, options: &NormalizeOptions) -> LinearTargets {
     let max_linear_lufs = stats.input_i + (options.true_peak_dbtp - stats.input_tp);
     let loudness_lufs = options.loudness_lufs.min(max_linear_lufs);
-    let loudness_range_lu = options.loudness_range_lu.max(stats.input_lra);
     LinearTargets {
         loudness_lufs,
-        loudness_range_lu,
         relaxed_loudness: loudness_lufs + f64::EPSILON < options.loudness_lufs,
-        relaxed_range: loudness_range_lu > options.loudness_range_lu + f64::EPSILON,
     }
 }
 
-fn loudnorm_args(
-    options: &NormalizeOptions,
-    targets: LinearTargets,
-    stats: Option<LoudnessStats>,
-) -> String {
-    let mut args = format!(
+fn loudnorm_args(options: &NormalizeOptions) -> String {
+    format!(
         "I={}:LRA={}:TP={}:linear=true",
-        targets.loudness_lufs, targets.loudness_range_lu, options.true_peak_dbtp
-    );
-    if let Some(stats) = stats {
-        // offset is overwritten by FFmpeg in linear mode (gain = target_i - measured_i);
-        // still pass the analysis suggestion for filter versions that consume it.
-        args.push_str(&format!(
-            ":measured_I={}:measured_TP={}:measured_LRA={}:measured_thresh={}:offset={}",
-            stats.input_i, stats.input_tp, stats.input_lra, stats.input_thresh, stats.target_offset
-        ));
-    }
-    args
+        options.loudness_lufs, options.loudness_range_lu, options.true_peak_dbtp
+    )
 }
 
 fn run_filter_to_end(input: &mut InputAudio, graph: &mut filter::Graph) -> Result<u64> {
@@ -502,12 +484,7 @@ fn analyze_loudness(path: &Path, options: &NormalizeOptions) -> Result<(AudioInf
         "loudnorm_probe",
         &format!(
             "{}:print_format=json:stats_file='{}'",
-            loudnorm_args(options, LinearTargets {
-                loudness_lufs: options.loudness_lufs,
-                loudness_range_lu: options.loudness_range_lu,
-                relaxed_loudness: false,
-                relaxed_range: false,
-            }, None),
+            loudnorm_args(options),
             stats_file
         ),
     )?;
@@ -576,7 +553,7 @@ fn is_noop(info: &AudioInfo, stats: LoudnessStats, options: &NormalizeOptions) -
         && options.offset_seconds.abs() < options.offset_tolerance_seconds
 }
 
-fn needs_loudness_adjustment(
+fn needs_gain_adjustment(
     stats: LoudnessStats,
     options: &NormalizeOptions,
     targets: LinearTargets,
@@ -591,7 +568,7 @@ fn transcode(
     options: &NormalizeOptions,
     stats: LoudnessStats,
     targets: LinearTargets,
-    apply_loudnorm: bool,
+    apply_gain: bool,
 ) -> Result<()> {
     let mut input = open_audio(source)?;
     let mut output_context = format::output_as(output, "wav")?;
@@ -622,13 +599,20 @@ fn transcode(
     let mut graph = filter::Graph::new();
     let source_filter = graph_source(&mut graph, &input.decoder)?;
     let mut previous = apply_offset(&mut graph, source_filter, input.decoder.rate(), options)?;
-    if apply_loudnorm {
+    if apply_gain {
+        let gain_db = targets.loudness_lufs - stats.input_i;
+        info!(
+            gain_db,
+            input_i = stats.input_i,
+            output_i = targets.loudness_lufs,
+            "applying constant loudness gain"
+        );
         previous = append_filter(
             &mut graph,
             &mut previous,
-            "loudnorm",
-            "loudnorm_apply",
-            &loudnorm_args(options, targets, Some(stats)),
+            "volume",
+            "loudness_gain",
+            &format!("volume={gain_db}dB:precision=double"),
         )?;
     }
     let mut converted = append_filter(
@@ -750,15 +734,13 @@ pub fn normalize(
     let destination = destination.as_ref();
     let (info, stats) = analyze_loudness(source, options)?;
     let targets = linear_targets(stats, options);
-    if targets.relaxed_loudness || targets.relaxed_range {
+    if targets.relaxed_loudness {
         info!(
             requested_i = options.loudness_lufs,
             effective_i = targets.loudness_lufs,
-            requested_lra = options.loudness_range_lu,
-            effective_lra = targets.loudness_range_lu,
             input_tp = stats.input_tp,
             target_tp = options.true_peak_dbtp,
-            "relaxed loudnorm targets to keep linear gain (avoid dynamic pumping)"
+            "relaxed loudness target to keep constant gain within the true-peak ceiling"
         );
     }
     if is_noop(&info, stats, options) {
@@ -773,15 +755,8 @@ pub fn normalize(
         .tempfile_in(parent)?;
     let temporary_path = temporary.path().to_owned();
     drop(temporary);
-    let apply_loudnorm = needs_loudness_adjustment(stats, options, targets);
-    let result = transcode(
-        source,
-        &temporary_path,
-        options,
-        stats,
-        targets,
-        apply_loudnorm,
-    );
+    let apply_gain = needs_gain_adjustment(stats, options, targets);
+    let result = transcode(source, &temporary_path, options, stats, targets, apply_gain);
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary_path);
         return Err(error);
@@ -857,14 +832,12 @@ mod tests {
         let options = NormalizeOptions::default();
         let targets = linear_targets(stats, &options);
         assert!(targets.relaxed_loudness);
-        assert!(!targets.relaxed_range);
         assert!((targets.loudness_lufs - (-10.92)).abs() < 1e-9);
-        assert_eq!(targets.loudness_range_lu, 11.0);
-        assert!(!needs_loudness_adjustment(stats, &options, targets));
+        assert!(!needs_gain_adjustment(stats, &options, targets));
     }
 
     #[test]
-    fn raises_lra_floor_instead_of_forcing_dynamic_compression() {
+    fn ignores_lra_when_planning_constant_gain() {
         let stats = LoudnessStats {
             input_i: -14.0,
             input_tp: -6.0,
@@ -875,10 +848,8 @@ mod tests {
         let options = NormalizeOptions::default();
         let targets = linear_targets(stats, &options);
         assert!(!targets.relaxed_loudness);
-        assert!(targets.relaxed_range);
-        assert_eq!(targets.loudness_lufs, -8.25);
-        assert_eq!(targets.loudness_range_lu, 18.0);
-        assert!(needs_loudness_adjustment(stats, &options, targets));
+        assert_eq!(targets.loudness_lufs, -8.5);
+        assert!(needs_gain_adjustment(stats, &options, targets));
     }
 
     #[test]
@@ -893,9 +864,7 @@ mod tests {
         let options = NormalizeOptions::default();
         let targets = linear_targets(stats, &options);
         assert!(!targets.relaxed_loudness);
-        assert!(!targets.relaxed_range);
-        assert_eq!(targets.loudness_lufs, -8.25);
-        assert_eq!(targets.loudness_range_lu, 11.0);
+        assert_eq!(targets.loudness_lufs, -8.5);
     }
 
     #[test]
@@ -933,6 +902,9 @@ mod tests {
         assert_eq!(output_info.channels, 2);
         assert_eq!(output_info.sample_rate, 44_100);
         assert_eq!(output_info.sample_format, "s32");
+        let (_, output_stats) = analyze_loudness(&output, &options)
+            .expect("normalized WAV loudness should be measurable");
+        assert!((output_stats.input_i - options.loudness_lufs).abs() < 0.2);
 
         let no_op_output = directory.path().join("no-op.wav");
         options.offset_seconds = 0.0;

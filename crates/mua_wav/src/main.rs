@@ -44,7 +44,7 @@ struct Normalize {
     sample_format: SampleFormat,
     #[arg(long, default_value_t = 48_000)]
     sample_rate: u32,
-    #[arg(long = "lufs", default_value_t = -8.25)]
+    #[arg(long = "lufs", default_value_t = -8.5)]
     loudness_lufs: f64,
     #[arg(long = "lu", default_value_t = 11.0)]
     loudness_range_lu: f64,
