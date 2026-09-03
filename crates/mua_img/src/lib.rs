@@ -8,11 +8,12 @@ use dds::{
     ColorFormat, CompressionQuality, Encoder, Format, ImageView, ImageViewMut, Size,
     header::{Dx9Header, FourCC, Header},
 };
-use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage, imageops::FilterType};
+use image::{DynamicImage, ImageDecoder, ImageReader, Rgba, RgbaImage, imageops::FilterType};
 use thiserror::Error;
 
 const DDS_MAGIC: &[u8; 4] = b"DDS ";
 const DDS_FOOTER: &[u8; 4] = b"POF0";
+pub const DEFAULT_BACKGROUND_OFFSET: i32 = 160;
 
 /// Errors returned by image and AFB operations.
 #[derive(Debug, Error)]
@@ -94,6 +95,24 @@ fn resized_rgba(path: &Path, width: u32, height: u32) -> Result<RgbaImage> {
     Ok(load_oriented(path)?
         .resize_exact(width, height, FilterType::Lanczos3)
         .to_rgba8())
+}
+
+fn offset_background(image: &RgbaImage, offset: i32) -> RgbaImage {
+    let (width, height) = image.dimensions();
+    let mut output = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 255]));
+    let shift = i64::from(offset);
+
+    for output_y in 0..height {
+        let source_y = i64::from(output_y) + shift;
+        if !(0..i64::from(height)).contains(&source_y) {
+            continue;
+        }
+        let source_y = u32::try_from(source_y).expect("source row is within image bounds");
+        for x in 0..width {
+            output.put_pixel(x, output_y, *image.get_pixel(x, source_y));
+        }
+    }
+    output
 }
 
 fn encode_dds(image: &RgbaImage, format: Format) -> Result<Vec<u8>> {
@@ -245,6 +264,25 @@ pub fn convert_stage(
     template: Option<&Path>,
     notes_field: Option<&Path>,
 ) -> Result<()> {
+    convert_stage_with_offset(
+        background,
+        destination,
+        effects,
+        template,
+        notes_field,
+        DEFAULT_BACKGROUND_OFFSET,
+    )
+}
+
+/// Convert and inject stage textures with a vertical background offset.
+pub fn convert_stage_with_offset(
+    background: &Path,
+    destination: &Path,
+    effects: &[Option<PathBuf>; 4],
+    template: Option<&Path>,
+    notes_field: Option<&Path>,
+    background_offset: i32,
+) -> Result<()> {
     let template_data = match template {
         Some(path) => read(path)?,
         None => mua_assets::ST_DUMMY_AFB.to_vec(),
@@ -255,7 +293,11 @@ pub fn convert_stage(
     }
     validate_chunks(&template_data, &chunks)?;
 
-    let background = encode_dds(&resized_rgba(background, 1920, 1080)?, Format::BC1_UNORM)?;
+    let background = resized_rgba(background, 1920, 1080)?;
+    let background = encode_dds(
+        &offset_background(&background, background_offset),
+        Format::BC1_UNORM,
+    )?;
     let effects = encode_dds(&effect_atlas(effects)?, Format::BC3_UNORM)?;
     let replaced = replace_chunks(&template_data, &chunks, &[&background, &effects])?;
     write(destination, &replaced)?;
@@ -330,6 +372,22 @@ mod tests {
         RgbaImage::from_pixel(width, height, color)
             .save(path)
             .expect("fixture image should save");
+    }
+
+    #[test]
+    fn positive_background_offset_moves_pixels_up_and_fills_bottom_black() {
+        let mut source = RgbaImage::new(2, 3);
+        for y in 0..3 {
+            for x in 0..2 {
+                source.put_pixel(x, y, Rgba([y as u8 + 1, 0, 0, 255]));
+            }
+        }
+
+        let shifted = offset_background(&source, 1);
+
+        assert_eq!(shifted.get_pixel(0, 0), &Rgba([2, 0, 0, 255]));
+        assert_eq!(shifted.get_pixel(0, 1), &Rgba([3, 0, 0, 255]));
+        assert_eq!(shifted.get_pixel(0, 2), &Rgba([0, 0, 0, 255]));
     }
 
     #[test]

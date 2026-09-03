@@ -36,6 +36,8 @@ enum Command {
         destination: PathBuf,
         #[arg(short = 'n', long)]
         notes_field: Option<PathBuf>,
+        #[arg(long, default_value_t = mua_img::DEFAULT_BACKGROUND_OFFSET)]
+        background_offset: i32,
         #[arg(long)]
         fx1: Option<PathBuf>,
         #[arg(long)]
@@ -73,16 +75,18 @@ fn execute(cli: Cli) -> mua_img::Result<()> {
             template,
             destination,
             notes_field,
+            background_offset,
             fx1,
             fx2,
             fx3,
             fx4,
-        } => mua_img::convert_stage(
+        } => mua_img::convert_stage_with_offset(
             &background,
             &destination,
             &[fx1, fx2, fx3, fx4],
             template.as_deref(),
             notes_field.as_deref(),
+            background_offset,
         ),
         Command::ExtractDds {
             source,
