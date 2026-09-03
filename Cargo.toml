@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/mua_assets",
-    "crates/mua_wav",
     "crates/mua_img",
 ]
 resolver = "3"
